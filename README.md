@@ -2,6 +2,17 @@
 
 Generate photomosaics from a library of movie poster images. Given a reference image, the tool finds the best-matching poster for each cell in a grid, producing a high-resolution mosaic.
 
+<p align="center">
+  <img src="docs/reference.jpg" width="200" alt="Reference image">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/overview.jpg" width="200" alt="100x100 mosaic">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/zoom.jpg" width="200" alt="Zoomed in to show individual poster tiles">
+</p>
+<p align="center">
+  <em>Reference &rarr; 100x100 mosaic (10,000 unique posters) &rarr; zoomed detail</em>
+</p>
+
 ## How it works
 
 The pipeline has two steps:
