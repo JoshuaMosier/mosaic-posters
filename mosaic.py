@@ -11,6 +11,7 @@ Usage:
 import argparse
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -59,21 +60,27 @@ def image_to_vector(img: Image.Image) -> np.ndarray:
 
 
 def compute_all_cell_vectors(reference: Image.Image, cols: int, rows: int) -> np.ndarray:
-    """Precompute all cell vectors from the reference image."""
+    """Precompute all cell vectors from the reference image using threaded resizing."""
     ref_w, ref_h = reference.size
     cell_w = ref_w / cols
     cell_h = ref_h / rows
 
     vectors = np.empty((rows * cols, 450), dtype=np.float32)
 
-    for row in tqdm(range(rows), desc="Computing cell vectors"):
-        for col in range(cols):
-            left = int(col * cell_w)
-            top = int(row * cell_h)
-            right = int((col + 1) * cell_w)
-            bottom = int((row + 1) * cell_h)
-            cell_img = reference.crop((left, top, right, bottom))
-            vectors[row * cols + col] = image_to_vector(cell_img)
+    def process_cell(args):
+        row, col = args
+        left = int(col * cell_w)
+        top = int(row * cell_h)
+        right = int((col + 1) * cell_w)
+        bottom = int((row + 1) * cell_h)
+        cell_img = reference.crop((left, top, right, bottom))
+        return row * cols + col, image_to_vector(cell_img)
+
+    num_workers = min(os.cpu_count() or 4, 16)
+    work = [(r, c) for r in range(rows) for c in range(cols)]
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for i, vec in tqdm(executor.map(process_cell, work), total=len(work), desc="Computing cell vectors"):
+            vectors[i] = vec
 
     return vectors
 
@@ -98,16 +105,23 @@ def build_mosaic(
     cell_vectors = compute_all_cell_vectors(reference, cols, rows)
 
     # Phase 2: Compute squared Euclidean distances via BLAS matmul
-    # ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a.b
+    # ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a·b  (computed in-place to save memory)
     print("Computing distances...")
-    q_sq = np.sum(cell_vectors ** 2, axis=1, keepdims=True)  # (n_cells, 1)
-    v_sq = np.sum(vectors ** 2, axis=1, keepdims=True).T     # (1, n_posters)
-    dot = cell_vectors @ vectors.T                            # (n_cells, n_posters)
-    dists = q_sq + v_sq - 2 * dot                            # (n_cells, n_posters)
+    dists = cell_vectors @ vectors.T          # (n_cells, n_posters)
+    dists *= -2
+    dists += np.sum(cell_vectors ** 2, axis=1, keepdims=True)
+    dists += np.sum(vectors ** 2, axis=1, keepdims=True).T
 
-    # Sort all candidates by distance for each cell
-    print("Sorting candidates...")
-    all_sorted = np.argsort(dists, axis=1)  # (n_cells, n_posters)
+    # Partial sort: only rank the top-k closest candidates per cell.
+    # With 31k posters and 6400 cells, top-1000 covers all assignments.
+    top_k = min(n_posters, 1000)
+    print(f"Sorting top-{top_k} candidates...")
+    top_indices = np.argpartition(dists, top_k, axis=1)[:, :top_k]
+    # Sort just the top-k by distance
+    row_idx = np.arange(n_cells)[:, None]
+    top_dists = dists[row_idx, top_indices]
+    sort_order = np.argsort(top_dists, axis=1)
+    top_sorted = np.take_along_axis(top_indices, sort_order, axis=1)
 
     # Phase 3: Sequential greedy assignment
     used = set()
@@ -115,37 +129,46 @@ def build_mosaic(
 
     print("Assigning tiles...")
     for i in range(n_cells):
-        indices = all_sorted[i]
         chosen = None
-        for idx in indices:
+        for idx in top_sorted[i]:
             if idx not in used:
-                chosen = idx
-                used.add(idx)
+                chosen = int(idx)
+                used.add(chosen)
                 break
+
+        # Fallback: if top-k exhausted, scan full row (rare)
         if chosen is None:
-            chosen = indices[0]
+            for idx in np.argsort(dists[i]):
+                if int(idx) not in used:
+                    chosen = int(idx)
+                    used.add(chosen)
+                    break
+        if chosen is None:
+            chosen = int(top_sorted[i, 0])
         tile_assignments.append(chosen)
 
-    # Phase 4: Assemble mosaic using cv2 for fast JPEG loading
+    # Phase 4: Assemble mosaic — load tiles in parallel, place into array
     mosaic_w = cols * POSTER_W
     mosaic_h = rows * POSTER_H
     mosaic_arr = np.zeros((mosaic_h, mosaic_w, 3), dtype=np.uint8)
 
-    print(f"Assembling {mosaic_w}x{mosaic_h} mosaic...")
-    for i, idx in enumerate(tqdm(tile_assignments, desc="Placing tiles")):
-        fname = filenames[idx]
-        path = os.path.join(images_dir, fname)
-        tile = cv2.imread(path, cv2.IMREAD_COLOR)
-        if tile is None:
-            continue
-        tile_rgb = tile[:, :, ::-1]  # BGR -> RGB
-        row = i // cols
-        col = i % cols
-        y = row * POSTER_H
-        x = col * POSTER_W
-        mosaic_arr[y:y + POSTER_H, x:x + POSTER_W] = tile_rgb
+    def load_tile(args):
+        i, idx = args
+        path = os.path.join(images_dir, filenames[idx])
+        return i, cv2.imread(path, cv2.IMREAD_COLOR)
 
-    return Image.fromarray(mosaic_arr)
+    print(f"Assembling {mosaic_w}x{mosaic_h} mosaic...")
+    num_workers = min(os.cpu_count() or 4, 16)
+    work = list(enumerate(tile_assignments))
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for i, tile in tqdm(executor.map(load_tile, work), total=len(work), desc="Placing tiles"):
+            if tile is None:
+                continue
+            row, col = divmod(i, cols)
+            y, x = row * POSTER_H, col * POSTER_W
+            mosaic_arr[y:y + POSTER_H, x:x + POSTER_W] = tile[:, :, ::-1]
+
+    return mosaic_arr
 
 
 def main():
@@ -175,11 +198,12 @@ def main():
     print(f"Reference image: {ref.size[0]}x{ref.size[1]} (cropped to 2:3)")
 
     # Build mosaic
-    mosaic = build_mosaic(ref, vectors, filenames, args.images, args.cells, args.rows)
+    mosaic_arr = build_mosaic(ref, vectors, filenames, args.images, args.cells, args.rows)
 
-    # Save
-    mosaic.save(args.output, quality=95)
-    print(f"Saved mosaic to {args.output} ({mosaic.size[0]}x{mosaic.size[1]})")
+    # Save — cv2 writes BGR, so convert from RGB
+    print(f"Saving {mosaic_arr.shape[1]}x{mosaic_arr.shape[0]} mosaic...")
+    cv2.imwrite(args.output, mosaic_arr[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])
+    print(f"Saved mosaic to {args.output}")
 
 
 if __name__ == "__main__":
