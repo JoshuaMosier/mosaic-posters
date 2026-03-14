@@ -164,7 +164,7 @@ def main():
         return 0
 
     # Collect image files
-    files = sorted(f for f in os.listdir(images_dir) if f.lower().endswith((".jpg", ".jpeg")))
+    files = sorted(f for f in os.listdir(images_dir) if f.lower().endswith((".jpg", ".jpeg", ".png")))
     if args.limit > 0:
         files = files[: args.limit]
     print(f"Found {len(files)} images")

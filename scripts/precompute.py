@@ -97,10 +97,10 @@ def main():
         print(f"Error: image directory not found: {args.images}", file=sys.stderr)
         sys.exit(1)
 
-    # Collect all JPEG files
+    # Collect all image files
     files = sorted(
         f for f in os.listdir(args.images)
-        if f.lower().endswith((".jpg", ".jpeg"))
+        if f.lower().endswith((".jpg", ".jpeg", ".png"))
     )
     print(f"Found {len(files)} images in {args.images}")
 
