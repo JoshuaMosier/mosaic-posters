@@ -97,8 +97,9 @@ def build_mosaic(
     tile_h: int = DEFAULT_TILE_H,
 ) -> np.ndarray:
     """Build the mosaic image. Returns (BGR numpy array, unique tile count)."""
+    ref_w, ref_h = reference.size
     cols = cells
-    rows = rows_override if rows_override is not None else round(cells * (tile_h / tile_w))
+    rows = rows_override if rows_override is not None else round(cols * (ref_h / ref_w) * (tile_w / tile_h))
 
     n_cells = cols * rows
     n_posters = len(filenames)
@@ -126,7 +127,10 @@ def build_mosaic(
         dists += poster_norms[None, :]
 
         # Partial sort: top-k closest per cell
-        top_indices = np.argpartition(dists, top_k, axis=1)[:, :top_k]
+        if top_k < n_posters:
+            top_indices = np.argpartition(dists, top_k, axis=1)[:, :top_k]
+        else:
+            top_indices = np.broadcast_to(np.arange(n_posters), (end - start, n_posters)).copy()
         row_idx = np.arange(end - start)[:, None]
         top_dists = dists[row_idx, top_indices]
         sort_order = np.argsort(top_dists, axis=1)
@@ -242,7 +246,8 @@ def main():
     cv2.imwrite(args.output, mosaic_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
     # Output summary
-    rows_used = args.rows if args.rows is not None else round(args.cells * (tile_h / tile_w))
+    ref_w, ref_h = ref.size
+    rows_used = args.rows if args.rows is not None else round(args.cells * (ref_h / ref_w) * (tile_w / tile_h))
     file_size_mb = os.path.getsize(args.output) / (1024 * 1024)
     print(f"\nMosaic summary:")
     print(f"  Grid:         {args.cells}x{rows_used} grid")
